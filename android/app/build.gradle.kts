@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace = "com.dfdx047.dragonrage"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.dfdx047.dragonrage"
         minSdk = 29
-        targetSdk = 35
+        targetSdk = 36
         // CI passes the tag (android-v0.1.0 -> 0.1.0) and the run number
         // Without CI (a local build) the name is 0.9.0 and the code follows it (0.9.0 -> 900), so a local build of
         // a newer version always installs over the one before it; the same version again installs with `adb install -r`.
