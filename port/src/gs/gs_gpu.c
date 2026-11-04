@@ -487,6 +487,40 @@ static void lag_fence(SDL_GPUFence *f) {
     pthread_mutex_unlock(&sLagLock);
 }
 
+/* PowerVR on Android: the device is made without the optional features (depth clamping, clip distance, first-instance
+   indirect draws, anisotropy), as Mali's is. A Moto g56 (PowerVR BXM-8-256, driver 25.1@6715691) accepted the full
+   device but refused seven pipelines of a fight (vkCreateGraphicsPipelines), while a Moto g54 with the same GPU name
+   and an older driver (1.15@6133110) refused the full device itself, fell back to this one and played the same fight
+   without errors. The launcher keeps the GPU's name in gpu_name.txt (data/Renderer.kt). BT3_GPU_FULL=1: all features
+   as before, to compare. */
+static int gpu_powervr_lite(void) {
+#ifdef __ANDROID__
+    char name[96] = "";
+    char *c;
+    FILE *f;
+
+    if (getenv("BT3_GPU_FULL") != NULL) {
+        return 0;
+    }
+    f = fopen("gpu_name.txt", "r");
+    if (f == NULL) {
+        return 0;
+    }
+    if (fgets(name, sizeof(name), f) == NULL) {
+        name[0] = '\0';
+    }
+    fclose(f);
+    for (c = name; *c != '\0'; c++) {
+        if (*c >= 'A' && *c <= 'Z') {
+            *c = (char)(*c + 32);
+        }
+    }
+    return strstr(name, "powervr") != NULL;
+#else
+    return 0;
+#endif
+}
+
 /* --- pipelines ---------------------------------------------------------------------------------- */
 
 /* Where the keys of the pipelines the game has used are remembered between runs. Creating a pipeline takes the
@@ -539,7 +573,7 @@ static int pipeline_create(uint32_t key, int remember) {
     uint64_t t0;
 
     if (sPipeCount == 1024) {
-        return 0;
+        return -1;
     }
     SDL_zero(ci);
     SDL_zero(vb);
@@ -629,7 +663,7 @@ static int pipeline_create(uint32_t key, int remember) {
     }
     if (sPipes[sPipeCount].p == NULL) {
         fprintf(stderr, "bt3: pipeline %08x: %s\n", key, SDL_GetError());
-        return 0;
+        return -1; /* (0 is a pipeline's index: pipe_get takes the nearest working pipeline instead) */
     }
     if (remember) { /* first seen in this run: known from the next start on */
         FILE *f = fopen(pipeline_file(), "a");
@@ -665,6 +699,35 @@ static void pipelines_preload(void) {
     fprintf(stderr, "bt3: %d pipelines of earlier runs created in %.0f ms (%s)\n", n, (double)(gpu_now() - t0) / 1e6, pipeline_file());
 }
 
+/* A key whose pipeline the driver refused (seen on a PowerVR BXM-8-256: vkCreateGraphicsPipelines failed for seven
+   keys of a fight): the failure used to come back as 0, so those draws were made with pipeline 0, whatever it
+   was (another blend, another depth test, and for a vertex program's draw even another vertex layout: garbage
+   geometry). Now the nearest pipeline that does exist. What a draw cannot do without is kept: the vertex program, a
+   full-screen table pass, the stencil, the topology and whether the pass has a depth buffer. Of the rest (blend,
+   depth test and write, colour mask, the shader variant) the one that differs in the fewest bits of the key. */
+static int pipe_fallback(uint32_t key) {
+    const uint32_t must = (3u << 20) | (1u << 22) | (1u << 24) | (3u << 13) | (1u << 28);
+    int i, best = -1, bestCost = 1000;
+
+    for (i = 0; i < sPipeCount; i++) {
+        uint32_t k = sPipes[i].key;
+        int cost;
+        if (sPipes[i].p == NULL || ((k ^ key) & must) != 0) {
+            continue;
+        }
+        cost = __builtin_popcount(k ^ key);
+        if (cost < bestCost) {
+            bestCost = cost;
+            best = i;
+        }
+    }
+    if (best >= 0) {
+        fprintf(stderr, "bt3: pipeline %08x: draws take the pipeline %08x instead\n", key, sPipes[best].key);
+        return best;
+    }
+    return 0; /* (none made yet: as before) */
+}
+
 /* The pipeline of a key gs_draw.c derived from GS state: cached here, created on first sight. */
 static int pipe_get(uint32_t key) {
     int i;
@@ -674,7 +737,8 @@ static int pipe_get(uint32_t key) {
             return i;
         }
     }
-    return pipeline_create(key, 1);
+    i = pipeline_create(key, 1);
+    return i >= 0 ? i : pipe_fallback(key);
 }
 
 /* The same pipeline for a render pass without the depth buffer (bit 28): the passes whose draws neither test nor
@@ -829,9 +893,14 @@ static int vk_init(void) {
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, getenv("BT3_GPU_DEBUG") != NULL);
-        sDev = getenv("BT3_GPU_LITE") != NULL ? NULL : SDL_CreateGPUDeviceWithProperties(props);
+        int liteFirst = getenv("BT3_GPU_LITE") != NULL || gpu_powervr_lite();
+        sDev = liteFirst ? NULL : SDL_CreateGPUDeviceWithProperties(props);
         if (sDev == NULL) {
-            fprintf(stderr, "bt3: Vulkan device with all features: %s; trying without the optional ones\n", SDL_GetError());
+            if (liteFirst) {
+                fprintf(stderr, "bt3: Vulkan device: the optional features left off (PowerVR, or BT3_GPU_LITE; BT3_GPU_FULL=1 asks for all)\n");
+            } else {
+                fprintf(stderr, "bt3: Vulkan device with all features: %s; trying without the optional ones\n", SDL_GetError());
+            }
             SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false);
             SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, false);
             SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, false);
