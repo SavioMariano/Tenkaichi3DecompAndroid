@@ -729,16 +729,58 @@ static int pipe_fallback(uint32_t key) {
 }
 
 /* The pipeline of a key gs_draw.c derived from GS state: cached here, created on first sight. */
-static int pipe_get(uint32_t key) {
+static int pipe_find(uint32_t key) {
     int i;
-    if (!sShadowStencil) { key &= ~(1u << 24); }
     for (i = 0; i < sPipeCount; i++) {
         if (sPipes[i].key == key) {
             return i;
         }
     }
+    return -1;
+}
+
+/* The keys the driver refused, with the pipeline their draws take: the refusal is asked for once. gs_draw.c keeps
+   the answers by key in a table in which two keys can share a slot; with such a pair every draw of the one asked
+   for a pipeline again, and a refused key was made (and refused) again each time: 93 times in one fight on a
+   PowerVR BXM-8-256 (driver 25.1), each a compile the driver fails. */
+static struct { uint32_t key; int idx; } sBad[256];
+static int sBadCount;
+
+static int pipe_get(uint32_t key) {
+    int i;
+    if (!sShadowStencil) { key &= ~(1u << 24); }
+    i = pipe_find(key);
+    if (i >= 0) {
+        return i;
+    }
+    for (i = 0; i < sBadCount; i++) {
+        if (sBad[i].key == key) {
+            return sBad[i].idx;
+        }
+    }
     i = pipeline_create(key, 1);
-    return i >= 0 ? i : pipe_fallback(key);
+    if (i < 0 && (key & (1u << 23)) != 0 && (key & (1u << 25)) == 0) {
+        /* Refused with the shader without its depth output (bit 23): the same draw with the full one. That one
+           writes the depth itself, which the draw would not need, but it keeps the discards: the nearest pipeline
+           below is the one without them (bit 27), and a draw that needs its alpha test loses it there. */
+        uint32_t full = key & ~(1u << 23);
+        i = pipe_find(full);
+        if (i < 0) {
+            i = pipeline_create(full, 1);
+        }
+        if (i >= 0) {
+            fprintf(stderr, "bt3: pipeline %08x: draws take the one with the full shader (%08x)\n", key, full);
+        }
+    }
+    if (i < 0) {
+        i = pipe_fallback(key);
+    }
+    if (sBadCount < 256) {
+        sBad[sBadCount].key = key;
+        sBad[sBadCount].idx = i;
+        sBadCount++;
+    }
+    return i;
 }
 
 /* The same pipeline for a render pass without the depth buffer (bit 28): the passes whose draws neither test nor
