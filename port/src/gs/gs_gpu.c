@@ -29,6 +29,7 @@
 #include "gs_draw.h"
 #include "shaders.h" /* generated: kGsVertSpv, kGsFragSpv */
 #include "ui.h"
+static bool sPowerVR; /* experimental BXM compatibility retries */
 static bool sGpuLite; /* the device was made without depth clamping and the other optional features */
 
 extern int Port_Setting(const char *name, int def); /* plat_settings.c: the saved settings */
@@ -615,8 +616,9 @@ static int pipeline_create(uint32_t key, int remember) {
     SDL_GPUVertexAttribute at[3];
     uint64_t t0;
 
-    if (sPipeCount == 1024) {
-        return 0;
+    if (sPipeCount >= 1023) {
+        /* Reserved null slot: never substitute an unrelated pipeline. */
+        return 1023;
     }
     SDL_zero(ci);
     SDL_zero(vb);
@@ -699,14 +701,36 @@ static int pipeline_create(uint32_t key, int remember) {
     sPipes[sPipeCount].key = key;
     t0 = gpu_now();
     sPipes[sPipeCount].p = SDL_CreateGPUGraphicsPipeline(sDev, &ci);
+    /* All seven failing BXM keys in the supplied log select the no-depth-output
+       fragment shader. Retry only failed pipelines, preserving blend, masks,
+       topology and attachments. The full shader may cost early depth testing. */
+    if (sPowerVR && sPipes[sPipeCount].p == NULL) {
+        fprintf(stderr, "bt3: BXM pipeline %08x original: %s\n", key, SDL_GetError());
+        if ((key & (1u << 23)) && !(key & (1u << 25)) && !fx &&
+            ci.target_info.has_depth_stencil_target) {
+            ci.fragment_shader = (key & (1u << 27)) && sFsNd != NULL ? sFsNd : sFs;
+            sPipes[sPipeCount].p = SDL_CreateGPUGraphicsPipeline(sDev, &ci);
+            fprintf(stderr, "bt3: BXM pipeline %08x full-depth shader retry: %s\n", key,
+                    sPipes[sPipeCount].p != NULL ? "OK" : SDL_GetError());
+        }
+        if (sPipes[sPipeCount].p == NULL && !ci.rasterizer_state.enable_depth_clip) {
+            ci.rasterizer_state.enable_depth_clip = true;
+            sPipes[sPipeCount].p = SDL_CreateGPUGraphicsPipeline(sDev, &ci);
+            fprintf(stderr, "bt3: BXM pipeline %08x depth-clip retry: %s\n", key,
+                    sPipes[sPipeCount].p != NULL ? "OK" : SDL_GetError());
+        }
+    }
     gGpuPipeNs += gpu_now() - t0;
     {
         extern uint64_t gDrawPipeNs;
         gDrawPipeNs += gpu_now() - t0;
     }
     if (sPipes[sPipeCount].p == NULL) {
-        fprintf(stderr, "bt3: pipeline %08x: %s\n", key, SDL_GetError());
-        return 0;
+        fprintf(stderr, "bt3: pipeline %08x: %s (mask=%u blend=%u ztest=%d zwrite=%d topo=%d vu=%d fx=%d depthclip=%d targets=%u depthformat=%d)\n",
+                key, SDL_GetError(), (unsigned)wmask, (unsigned)(key & 0x3ff), ztst, zwrite, topo, vu, fx,
+                (int)ci.rasterizer_state.enable_depth_clip, (unsigned)ci.target_info.num_color_targets, (int)sDepthFormat);
+        /* Cache the failed key in its own slot; replay skips it. */
+        return sPipeCount++;
     }
     if (remember) { /* first seen in this run: known from the next start on */
         FILE *f = fopen(pipeline_file(), "a");
@@ -734,8 +758,8 @@ static void pipelines_preload(void) {
         for (i = 0; i < sPipeCount && sPipes[i].key != key; i++) {
         }
         if (i == sPipeCount && (key & ~0x1FFF7FFFu) == 0) {
-            pipeline_create(key, 0);
-            n++;
+            int idx = pipeline_create(key, 0);
+            if (sPipes[idx].p != NULL) n++;
         }
     }
     fclose(f);
@@ -947,6 +971,15 @@ static int vk_init(void) {
            SDL_GPU refuses, such as MaliSX2 0.2.3 on the Mali-G57, left this one behind and the game ran unseen) */
         return 0;
     }
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+    {
+        const char *name = SDL_GetStringProperty(SDL_GetGPUDeviceProperties(sDev), SDL_PROP_GPU_DEVICE_NAME_STRING, "");
+        const char *override = getenv("BT3_POWERVR_FIX");
+        sPowerVR = override != NULL ? atoi(override) != 0 :
+            (name != NULL && strstr(name, "PowerVR") != NULL && strstr(name, "BXM") != NULL);
+        fprintf(stderr, "bt3: PowerVR BXM compatibility retries: %s\n", sPowerVR ? "on" : "off");
+    }
+#endif
     sWindow = GsDraw_WindowCreate(0); /* the shared window: shape, display and full screen decided there */    if (sWindow == NULL || !SDL_ClaimWindowForGPUDevice(sDev, sWindow)) {
         fprintf(stderr, "bt3: no GPU window: %s\n", SDL_GetError());
         if (sWindow != NULL) {
@@ -1709,7 +1742,7 @@ static void aux_plan(void) {
 static int pipe_no_aux(int p) {
     if (sPipes[p].noAux == 0) {
         int q = pipe_get(sPipes[p].key | 1u << 26);
-        sPipes[p].noAux = q >= 0 && sPipes[q].key == (sPipes[p].key | 1u << 26) ? q + 1 : p + 1;
+        sPipes[p].noAux = q >= 0 && sPipes[q].p != NULL && sPipes[q].key == (sPipes[p].key | 1u << 26) ? q + 1 : p + 1;
     }
     return sPipes[p].noAux - 1;
 }
@@ -2013,6 +2046,12 @@ static void vk_frame_end(void) {
         struct { int32_t mode[4]; float misc[4]; float rect[4]; float orig[4]; float extra[4]; } fu;
         int shadowStart;
 
+        /* Failed Vulkan pipelines must not draw with pipeline zero or bind NULL. */
+        if ((!d->native || d->native == 3) &&
+            (d->pipeline < 0 || d->pipeline >= 1024 || sPipes[d->pipeline].p == NULL)) {
+            continue;
+        }
+
         if (d->native >= 100) { /* a picture uploaded into this display buffer (GsGpu_FbUpload): scaled into its texture */
             SDL_GPUBlitInfo bl;
             if (pass != NULL) {
@@ -2308,6 +2347,7 @@ static void vk_frame_end(void) {
                 passNoDepth = depthless && !useDepth && !passStencil && gsTargets[d->target].cleared;
                 for (j = n; passNoDepth && j < gsDrawCount && !gsDraws[j].native && gsDraws[j].target == d->target; j++) {
                     int pj = gsDraws[j].pipeline, qj;
+                    if (sPipes[pj].p == NULL) continue;
                     passNoDepth = pipe_depthless(pj) != pj; /* (made before the pass) */
                     /* (and of the variant without the alpha byte, which aux_plan may take: see the draws below) */
                     if (passNoDepth && aux_plan_on() && (sPipes[pj].key >> 16 & SDL_GPU_COLORCOMPONENT_A) && (qj = pipe_no_aux(pj)) != pj) {
